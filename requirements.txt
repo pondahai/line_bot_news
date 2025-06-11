@@ -1,0 +1,31 @@
+# Web framework for the Line Bot server
+Flask==3.0.3
+Jinja2==3.1.4 # Flask dependency
+
+# For making HTTP requests to Line and OpenAI APIs
+requests==2.32.3
+
+# To load environment variables from a .env file
+python-dotenv==1.0.1
+
+# For scheduling the daily news push job
+APScheduler==3.10.4
+
+# For parsing Google News RSS feeds
+feedparser==6.0.11
+
+# For parsing news articles.
+# Note: This library depends on lxml.
+newspaper3k==0.2.8
+
+# A crucial dependency for newspaper3k, often needs to be specified.
+lxml==5.2.2
+
+# For browser automation to scrape dynamic web pages
+selenium==4.22.0
+
+# To automatically manage the ChromeDriver for Selenium
+webdriver-manager==4.0.1
+
+# Werkzeug is a core dependency of Flask, specifying it helps avoid conflicts.
+Werkzeug==3.0.3
