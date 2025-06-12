@@ -1,160 +1,138 @@
-# 個性化 LLM 新聞彙整 Line Bot
+# Line AI 新聞助理與聊天機器人 (v5)
 
-這是一個基於 Python Flask 的 Line Bot 專案，它實現了以下主要功能：
+這是一個功能強大、架構健壯的 Line 聊天機器人，整合了 Selenium 網頁爬蟲、大型語言模型 (LLM)、非同步背景任務處理以及多層快取機制。它不僅能作為一個具備上下文記憶的聊天夥伴，還能主動為使用者抓取、摘要並推送客製化的新聞內容。
 
-1.  **個性化每日新聞彙整與推播**：
-    *   定時（預設每日早上9點）從 Google News RSS 抓取新聞。
-    *   用戶可以通過指令 "訂閱新聞 [我的關鍵字]" 來設定自己感興趣的新聞主題，如果未指定則使用預設關鍵字 (如 LLM, AI 等)。
-    *   使用大型語言模型 (如 OpenAI GPT 系列，或本地部署的 LLM) 對抓取到的新聞進行摘要和整理。
-    *   在摘要中包含新聞的原始標題、來源和 **直接輸出的原文 URL** (Line 會自動轉為可點擊連結)。
-    *   將彙整後的新聞摘要主動推播給已訂閱的 Line 用戶。
-    *   支援在新聞摘要生成過程中，如果 LLM 輸出思考過程 (使用 `<think>` 標籤)，則將思考過程與正式摘要分開發送，並帶有視覺分離延遲。
-    *   當用戶成功訂閱或更新新聞關鍵字後，會立即觸發一次基於新設定的新聞推播。
+## ✨ 核心功能
 
-2.  **互動式聊天機器人**：
-    *   用戶可以通過特定的關鍵字 (在 `.env` 中配置的 `BOT_NAMES`) 觸發與 LLM 的對話。
-    *   支援解析 LLM 回應中的 `<think>` 標籤，將思考過程和正式回答分開，並帶有視覺分離延遲，以提升用戶體驗。
+- **進階對話系統**:
+  - **被動監聽**: 在群組中，Bot 會默默記錄所有公開對話，以建立完整的對話上下文。
+  - **指令觸發**: 透過在訊息開頭使用 `/bot` 指令來與 Bot 互動，避免干擾正常聊天。
+  - **上下文理解**: 能夠理解群組中多人、連續的對話，提供更貼切的回應。
+  - **用戶識別**: 可獲取群組成員的顯示名稱，並帶有快取機制，讓對話歷史更具可讀性。
+  - **可配置的思考過程**: 可在 `.env` 中設定是否顯示 LLM 的思考過程，方便除錯。
 
-3.  **用戶訂閱與偏好管理**：
-    *   用戶可以通過向 Bot 發送指令 (如 "訂閱新聞 [關鍵字]" / "訂閱新聞" / "取消訂閱新聞") 來管理新聞推播的訂閱狀態和新聞關鍵字。
-    *   用戶加 Bot 好友時，會收到訂閱引導提示。
-    *   用戶訂閱狀態和自定義新聞關鍵字持久化儲存 (目前使用 `user_preferences.json` 檔案)。
+- **智慧新聞服務**:
+  - **一次性查詢**: 使用 `/bot 新聞` 立即獲取最新 AI 新聞，或用 `/bot 新聞 [主題]` 查詢特定新聞。
+  - **持久化訂閱**: 使用 `/bot 訂閱 [主題]` 來設定每日定時新聞推播，並可隨時查看或取消訂閱。
+  - **兩階段摘要**: 採用先進的兩階段摘要流程，先精簡單篇文章，再彙整成風格化的 Podcast 內容，兼顧品質與效率。
+  - **新聞摘要快取**: 對已生成的新聞摘要進行快取，在一小時內重複請求可實現秒級回應，大幅節省 API 成本。
+  - **時間戳記**: 所有新聞摘要都會附上生成時間，讓用戶了解資訊的時效性。
 
-4.  **訊息處理**：
-    *   自動將過長的訊息（LLM 回應、新聞摘要、思考過程）分割成多條適合 Line 發送的片段。
+- **健壯的系統架構**:
+  - **混合式任務處理**:
+    - **即時查詢**: 採用同步處理，配合快取機制，最大化利用免費的 Line Reply API。
+    - **定時推播**: 採用非同步背景任務，不阻塞主程式。
+  - **序列化任務鏈**: 定時推播任務會為每個訂閱者建立一個序列化的任務鏈，避免同時向後端服務發送大量請求，保護伺服器。
+  - **平行化爬蟲**: 新聞抓取過程採用平行化處理，可透過 `.env` 設定平行度，顯著提升抓取速度。
+  - **跨平台部署**: 自動偵測作業系統，在開發環境 (Windows/macOS) 和生產環境 (Linux/ARM) 之間無縫切換 Selenium Driver 設定。
 
-## 功能特性
+## 🛠️ 安裝與設定
 
-*   **定時任務**：使用 APScheduler 執行每日新聞抓取和推播。
-*   **LLM 整合**：通過 API 與 OpenAI (或本地/其他雲端 LLM) 進行交互，用於對話和新聞摘要。
-*   **Line Messaging API 互動**：接收 webhook 事件，發送回覆 (Reply) 和主動推播 (Push) 訊息。
-*   **個性化新聞源**：用戶可自訂新聞搜尋關鍵字。
-*   **環境變數配置**：所有敏感資訊和重要配置（API Keys, Bot 名稱, Timeout 時間等）均通過 `.env` 文件管理。
-*   **詳細日誌記錄**：方便追蹤和調試。
-*   **啟動時執行選項**：可配置在應用啟動時立即執行一次新聞推播任務，方便測試。
-*   **適應本地 LLM**：支援通過環境變數配置較長的 API Timeout 時間。
+### 1. 前置需求
+- Python 3.8 或更高版本
+- Google Chrome 或 Chromium 瀏覽器
+- **Linux/ARM 平台**:
+  ```bash
+  sudo apt-get update
+  sudo apt-get install -y libxml2-dev libxslt1-dev python3-dev chromium-chromedriver
+  ```
 
-## 技術棧
-
-*   **後端框架**: Python, Flask
-*   **Line Bot API 互動**: 直接與 Line Messaging API 進行 HTTP 請求。
-*   **LLM API**: OpenAI API (或本地/其他雲端 LLM 的 API 接口)
-*   **任務排程**: APScheduler
-*   **新聞來源**: Google News RSS (通過 `feedparser` 解析)
-*   **HTTP 請求**: `requests` 庫
-*   **環境變數管理**: `python-dotenv`
-*   **數據儲存**: JSON 文件 (用於用戶偏好)
-
-## 環境準備與安裝
-
-1.  **Python 環境**: 確保已安裝 Python 3.8 或更高版本。
-2.  **虛擬環境 (推薦)**:
+### 2. 安裝步驟
+1.  **克隆專案庫**
     ```bash
-    python -m venv venv
-    source venv/bin/activate  # Linux/macOS
-    # venv\Scripts\activate    # Windows
+    git clone [你的專案庫 URL]
+    cd [專案目錄]
     ```
-3.  **安裝依賴**:
+
+2.  **建立虛擬環境**
     ```bash
-    pip install Flask python-dotenv requests feedparser APScheduler click
-    ```
-    (如果使用了 Flask CLI 命令，則需要 `click`)
-
-4.  **設定 Line Bot Channel**:
-    *   前往 [Line Developers Console](https://developers.line.biz/)。
-    *   建立一個 Messaging API Channel。
-    *   獲取 `Channel access token (long-lived)` 和 `Channel secret`。
-
-5.  **準備 LLM API**:
-    *   如果你使用 OpenAI，請申請 API Key。
-    *   如果你使用本地或其他 LLM，確保其 API 接口已準備就緒。
-
-6.  **建立 `.env` 配置文件**:
-    在專案根目錄下建立一個名為 `.env` 的文件，並填入以下內容（替換為你自己的值）：
-    ```env
-    # Line Bot 設定
-    LINE_CHANNEL_ACCESS_TOKEN=YOUR_LINE_CHANNEL_ACCESS_TOKEN
-    LINE_CHANNEL_SECRET=YOUR_LINE_CHANNEL_SECRET
-
-    # LLM API 設定
-    OPENAI_API_KEY=YOUR_LLM_API_KEY # 不一定是OpenAI，取決於你用的LLM
-    OPENAI_COMPLETION_MODEL=your_llm_model_name # 例如 gpt-3.5-turbo, 或本地模型的標識符
-    OPENAI_BASE_URL=https_your_llm_api_base_url # 例如 https://api.openai.com 或本地服務的 URL (http://localhost:8000)
-    OPENAI_API_TIMEOUT=600 # LLM API 請求超時時間（秒），本地LLM可能需要更長
-
-    # Bot 行為設定
-    BOT_NAMES=小幫手,AI助手 # 你的機器人名稱，用逗號分隔
-    BOT_DEACTIVATED=False 
-    DEFAULT_NEWS_KEYWORDS="大型語言模型 OR LLM OR 生成式AI" # 預設新聞關鍵字
-    VISUAL_SEPARATION_DELAY=1.0 # CoT思考與正式回答間的視覺分離延遲（秒）
-
-    # 測試推播用 (可選)
-    TARGET_USER_ID_FOR_TESTING=YOUR_OWN_LINE_USER_ID 
-
-    # 啟動時執行新聞任務 (True/False)
-    RUN_JOB_ON_STARTUP=True 
+    python3 -m venv venv
+    source venv/bin/activate
     ```
 
-## 運行方式
+3.  **安裝依賴套件**
+    ```bash
+    pip install -r requirements.txt
+    ```
+    *若 `lxml` 安裝失敗，請確保前置需求已安裝，或嘗試 `pip install "lxml[html_clean]"`*
 
-### 1. 本地開發運行
+4.  **設定環境變數 (`.env` 檔案)**
+    - 建立一個 `.env` 檔案，並填入以下必要的憑證與設定：
+      ```ini
+      # --- Line Bot 憑證 ---
+      LINE_CHANNEL_ACCESS_TOKEN="YOUR_LINE_CHANNEL_ACCESS_TOKEN"
+      LINE_CHANNEL_SECRET="YOUR_LINE_CHANNEL_SECRET"
 
+      # --- OpenAI / 自架 LLM 伺服器憑證與設定 ---
+      OPENAI_API_KEY="YOUR_API_KEY_OR_A_PLACEHOLDER"
+      OPENAI_BASE_URL="https://api.openai.com/v1" # 或你的 ngrok/自架 URL
+      OPENAI_COMPLETION_MODEL="gpt-4o-mini"
+
+      # --- Bot 行為設定 ---
+      BOT_TRIGGER_WORD="/bot"
+      MAX_HISTORY_MESSAGES=50
+      SHOW_THINKING_PROCESS="false" # 設為 true 以顯示 LLM 思考過程
+
+      # --- 效能與快取設定 ---
+      NEWS_FETCH_MAX_WORKERS=4  # 新聞抓取的最大平行數量
+      NEWS_SUMMARY_CACHE_SECONDS=3600  # 新聞摘要快取時間 (秒)
+      USER_PROFILE_CACHE_SECONDS=7200  # 用戶名稱快取時間 (秒)
+
+      # --- 開發與測試用設定 (可選) ---
+      TARGET_USER_ID_FOR_TESTING="YOUR_OWN_USER_ID"
+      RUN_JOB_ON_STARTUP="false" # 設為 true 可在啟動時執行一次新聞推播
+      ```
+
+5.  **建立初始資料檔案**
+    - 在專案根目錄手動建立兩個空的 JSON 檔案：
+      ```bash
+      echo "{}" > user_preferences.json
+      echo "{}" > conversation_history.json
+      echo "{}" > news_cache.json
+      ```
+
+6.  **設定 Line Developer Console**
+    - **Messaging API 分頁**:
+      - **Use webhooks**: `Enabled` (啟用)
+      - **Auto-reply messages**: `Disabled` (停用)
+      - **Greeting messages**: `Enabled` (啟用，並貼上歡迎訊息)
+
+## 🚀 執行程式
+
+### 本地測試模式
+此模式會執行完整的新聞抓取與摘要流程，並將結果印在終端機上，適合在不啟動 Web 服務的情況下進行功能測試。
 ```bash
-python your_bot_script_name.py  # 例如：python line_bot_final_v5.py
+# 測試預設 AI 主題新聞
+python line_bot_v5.py --test-news
+
+# 測試自訂主題新聞，並限制只處理 3 篇文章
+python line_bot_v5.py --test-news --keywords "Apple Vision Pro" --limit 3
 ```
-伺服器預設會在 `http://0.0.0.0:5000` 上運行。
 
-### 2. 設定 Webhook URL
-
-使用 `ngrok` 或類似工具將本地伺服器暴露到公網：
+### 生產/Web 伺服器模式
+使用 Gunicorn (推薦) 或直接執行 Python 檔案來啟動 Line Bot 服務。
 ```bash
-ngrok http 5000
+# 推薦使用 Gunicorn (請先 pip install gunicorn)
+gunicorn --workers 4 --bind 0.0.0.0:5000 line_bot_v5:app
+
+# 或者直接執行 (僅適合開發)
+python line_bot_v5.py
 ```
-獲取 `ngrok` 提供的 HTTPS URL，然後在 Line Developers Console 中你的 Channel 設定頁面，將 "Webhook URL" 設置為 `https://your-ngrok-url.ngrok-free.app/webhook` 並啟用 Webhook。
 
-## 檔案結構 (主要檔案)
+## 📝 指令列表
 
-*   `your_bot_script_name.py`: 主應用程式邏輯。
-*   `.env`: 環境變數配置文件 (需自行建立)。
-*   `user_preferences.json`: 儲存用戶訂閱狀態和新聞關鍵字 (自動生成)。
-*   `requirements.txt` (可選): 通過 `pip freeze > requirements.txt` 生成。
+-   `/bot [任何問題]`：與 AI 進行一般對話。
+-   `/bot help` 或 `/bot 幫助`: 顯示此幫助訊息。
 
-## 主要功能模塊說明
+---
+### 📰 新聞功能
 
-*   **Webhook 處理 (`@app.route('/webhook')`, `handle_text_message_event`)**:
-    處理 Line 事件，包括用戶訊息（觸發對話或訂閱指令）、關注/取消關注事件。
-*   **新聞處理 (`fetch_llm_news_from_google_rss`, `summarize_news_with_llm`)**:
-    根據預設或用戶自定義關鍵字獲取新聞，並使用 LLM 進行摘要。
-*   **排程任務 (`daily_news_push_job`, APScheduler setup)**:
-    每日定時為訂閱用戶生成並推播個性化新聞彙整。
-*   **單用戶新聞推送 (`generate_and_push_news_for_user`)**:
-    封裝了為指定用戶獲取、摘要、CoT處理並推送新聞的邏輯，供定時任務和即時觸發調用。
-*   **訊息發送與分割 (`send_line_messages`, `split_long_message`)**:
-    統一處理向 Line 發送訊息，並自動分割長訊息。
-*   **用戶偏好管理 (`load_user_preferences`, `save_user_preferences`)**:
-    通過 JSON 文件管理用戶的訂閱狀態和新聞關鍵字。
+-   `/bot 新聞`: 立即查詢 AI 主題新聞。
+-   `/bot 新聞 [主題]`: 立即查詢特定主題新聞。
+-   `/bot 新聞 關鍵字:[主題]`: (效果同上)
+-   `/bot 訂閱`: 訂閱每日 AI 主題新聞推播。
+-   `/bot 訂閱 [主題]`: 訂閱每日特定主題的新聞。
+-   `/bot 查看訂閱`: 查看目前的訂閱狀態與主題。
+-   `/bot 取消訂閱`: 取消每日新聞推播。
 
-## 與 Bot 互動指令
-
-*   **對話**: `@你的Bot名稱 [你的問題]` (例如: `@小幫手 今天天氣如何？`)
-*   **訂閱預設新聞**: `訂閱新聞`
-*   **訂閱自定義新聞**: `訂閱新聞 [你想關注的關鍵字，用空格分隔]` (例如: `訂閱新聞 Python 人工智慧`)
-*   **取消訂閱新聞**: `取消訂閱新聞`
-
-## 未來可能的改進方向
-
-*   **資料庫整合**: 使用 SQLite 或更大型資料庫替代 JSON 文件，以支援更大用戶量和更複雜查詢。
-*   **Line Bot SDK**: 考慮遷移到使用官方 `line-bot-sdk-python`。
-*   **更豐富的訊息類型**: 使用 Flex Message、Quick Reply 等。
-*   **進階關鍵字管理**: 允許用戶管理多組關鍵字，或排除某些關鍵字。
-*   **錯誤監控與告警**: 整合 Sentry 等。
-*   **部署優化**: Docker 容器化，使用 Gunicorn/Uvicorn。
-*   **非同步處理**: 對於耗時的 LLM 調用或新聞處理，考慮使用任務隊列 (如 Celery) 實現非同步，避免阻塞 Webhook 回應。
-
-## 貢獻
-
-歡迎提交 Pull Requests 或 Issues。
-
-## 授權
-
-(可選，例如 MIT License)
+---
