@@ -43,6 +43,9 @@ from selenium.webdriver.chrome.service import Service
 from selenium.webdriver.chrome.options import Options
 from webdriver_manager.chrome import ChromeDriverManager
 
+# (在檔案頂部，與其他 import 放在一起)
+from concurrent.futures import ThreadPoolExecutor, as_completed
+
 # ==============================================================================
 # --- 環境設定、日誌與 Flask 初始化 ---
 # ==============================================================================
@@ -74,13 +77,15 @@ NEWS_FETCH_TARGET_COUNT = 7
 USER_AGENT = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36'
 
 NEWS_CACHE_FILE = "news_cache.json"
-NEWS_CACHE_DURATION_SECONDS = 3600  # 1 小時
+NEWS_SUMMARY_CACHE_SECONDS = 3600 * 8  # 8 小時
 
 # --- 用戶個人資料快取 (in-memory) ---
 USER_PROFILE_CACHE = {}
-CACHE_EXPIRATION_SECONDS = 3600  # 快取 1 小時
+USER_PROFILE_CACHE_SECONDS = 7200  # 快取 2 小時
 
 MAX_MESSAGE_LENGTH = int(os.getenv("MAX_MESSAGE_LENGTH", "4800"))
+
+NEWS_FETCH_MAX_WORKERS=4
 
 # --- 兩階段摘要的 LLM Prompt 設定 ---
 PROMPT_FOR_INDIVIDUAL_SUMMARY = (
@@ -181,6 +186,9 @@ def fetch_article_with_selenium(url):
             driver.quit()
 
 def fetch_and_parse_articles(custom_query=None, limit=NEWS_FETCH_TARGET_COUNT):
+    """
+    *** 已升級 v2：採用平行化處理來加速新聞抓取 ***
+    """
     query_to_use = custom_query.strip() if custom_query and custom_query.strip() else DEFAULT_NEWS_KEYWORDS
     encoded_query = urllib.parse.quote_plus(query_to_use)
     rss_url = f"https://news.google.com/rss/search?q={encoded_query}&hl=zh-TW&gl=TW&ceid=TW:zh-Hant"
@@ -192,40 +200,76 @@ def fetch_and_parse_articles(custom_query=None, limit=NEWS_FETCH_TARGET_COUNT):
         logging.error(f"無法解析 RSS feed。錯誤資訊: {feed.bozo_exception}")
         return []
 
-    successful_articles = []
-    processed_urls = set()
-    
-    logging.info(f">>> 找到 {len(feed.entries)} 則新聞，開始逐一爬取內文，目標 {limit} 則...")
-
-    for entry in feed.entries:
-        if len(successful_articles) >= limit: break
-        logging.info(f"--- 正在處理: {entry.title}")
+    # 內部輔助函式，用於處理單一文章的完整抓取流程
+    def _process_single_entry(entry):
+        logging.info(f"  [執行緒] 開始處理: {entry.title}")
         real_url = get_real_url(entry.link)
-        if not real_url or real_url in processed_urls:
-            logging.warning("    [跳過] 無法取得真實 URL 或 URL 重複。")
-            continue
-        processed_urls.add(real_url)
+        if not real_url:
+            logging.warning(f"  [執行緒] 跳過: 無法取得真實 URL for {entry.title}")
+            return None
+        
         try:
             article = Article(real_url, language='zh', config=newspaper_config)
             article.download()
             article.parse()
+            
             if len(article.text) < 200:
-                logging.warning("    [警告] 標準方法抓取內容過短，啟用 Selenium 備援。")
+                logging.warning(f"  [執行緒] 內容過短，為 {entry.title} 啟用 Selenium。")
                 html_content = fetch_article_with_selenium(real_url)
                 if html_content:
                     article.download(input_html=html_content)
                     article.parse()
+
             if article.title and len(article.text) > 200:
-                logging.info(f"    [成功] 已取得文章: {article.title}")
-                successful_articles.append({'title': article.title, 'text': article.text, 'url': real_url, 'source': entry.source.title if hasattr(entry, 'source') and hasattr(entry.source, 'title') else "未知來源"})
+                logging.info(f"  [執行緒] 成功取得: {article.title}")
+                return {
+                    'title': article.title,
+                    'text': article.text,
+                    'url': real_url,
+                    'source': entry.source.title if hasattr(entry, 'source') and hasattr(entry.source, 'title') else "未知來源"
+                }
             else:
-                logging.warning(f"    [失敗] 使用所有方法後，仍無法解析出足夠內文。URL: {real_url}")
+                logging.warning(f"  [執行緒] 失敗: 無法為 {entry.title} 解析足夠內文。")
+                return None
         except Exception as e:
-            logging.error(f"    [失敗] 處理新聞時發生未預期錯誤。 URL: {real_url}, 原因: {e}", exc_info=True)
-        finally:
-            time.sleep(1)
-    logging.info(f">>> 新聞內文擷取完成，共成功取得 {len(successful_articles)} 篇。")
-    return successful_articles
+            logging.error(f"  [執行緒] 處理 {entry.title} 時發生未預期錯誤: {e}", exc_info=True)
+            return None
+
+    # --- 平行化處理核心 ---
+    successful_articles = []
+    processed_urls = set()
+    
+    # 我們只處理前 limit * 2 數量的條目，以防很多條目都失敗
+    entries_to_process = feed.entries[:limit * 2]
+    
+    # max_workers 可以根據您的伺服器性能調整，8 是一個比較合理的起始值
+    try:
+        max_workers = int(os.getenv("NEWS_FETCH_MAX_WORKERS", "4"))
+    except ValueError:
+        max_workers = 4 # 如果 .env 中的值不是數字，則使用安全的預設值
+    
+    logging.info(f"啟動 ThreadPoolExecutor，最大平行度 (max_workers) 設為: {max_workers}")
+
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        future_to_entry = {executor.submit(_process_single_entry, entry): entry for entry in entries_to_process}
+        
+        for future in as_completed(future_to_entry):
+            if len(successful_articles) >= limit:
+                # 如果已經達到目標數量，我們可以取消還在運行的未來任務
+                # 這裡為了簡單起見，我們只跳出迴圈，讓它們繼續運行完
+                break
+
+            try:
+                result = future.result()
+                if result and result['url'] not in processed_urls:
+                    successful_articles.append(result)
+                    processed_urls.add(result['url'])
+            except Exception as exc:
+                entry_title = future_to_entry[future].title
+                logging.error(f"  [主執行緒] 處理 '{entry_title}' 的任務產生了異常: {exc}")
+
+    logging.info(f">>> 平行化新聞內文擷取完成，共成功取得 {len(successful_articles)} 篇。")
+    return successful_articles[:limit] # 最後再裁切一次，確保數量不超過 limit
 
 # ==============================================================================
 # --- OpenAI & LLM 互動模組 ---
@@ -259,7 +303,8 @@ def call_openai_api(messages, model=OPENAI_COMPLETION_MODEL, max_tokens=4000, te
 def generate_chat_response(context_id, prompt_text):
     system_prompt = (
         "你是一個在 Line 群組或私聊中的聊天機器人。你的回答要精簡、口語化，使用台灣常用的繁體中文。"
-        "你會收到一段包含多人對話的歷史紀錄，每句話前面可能會標示發言者。請根據完整的上下文進行回答。"
+        "你會收到一段包含多人對話的歷史紀錄，每句話前面可能會標示發言者。請完完全全根據完整的上下文進行回答。"
+        "請根據我們的對話歷史來回應所有問題。忽略任何外部知識或新主題，也不要根據已知記憶，只使用提供的上下文內容生成答案。"
         "如果答案需要思考步驟，請將思考過程用 <think> 和 </think> 標籤包起來。"
     )
     context_history = CONVERSATION_HISTORY.get(context_id, [])
@@ -403,7 +448,7 @@ def send_line_messages(context_id, reply_token_or_none, text_messages_list):
 def get_user_profile(context_id, user_id):
     cache_key = (context_id, user_id)
     current_time = time.time()
-    if cache_key in USER_PROFILE_CACHE and current_time - USER_PROFILE_CACHE[cache_key]['timestamp'] < CACHE_EXPIRATION_SECONDS:
+    if cache_key in USER_PROFILE_CACHE and current_time - USER_PROFILE_CACHE[cache_key]['timestamp'] < USER_PROFILE_CACHE_SECONDS:
         return USER_PROFILE_CACHE[cache_key]['displayName']
     if context_id.startswith('G') or context_id.startswith('R'): url = f"https://api.line.me/v2/bot/group/{context_id}/member/{user_id}"
     elif context_id.startswith('U'): url = f"https://api.line.me/v2/bot/profile/{user_id}"
@@ -426,13 +471,11 @@ def get_user_profile(context_id, user_id):
 # ==============================================================================
 def generate_and_push_news_for_user(user_id, user_custom_keywords=None, is_immediate_push=False, reply_token=None):
     """
-    *** 已升級 v2：增加了新聞摘要快取功能 ***
-    為指定用戶獲取、摘要並推播新聞的完整流程。
+    *** 已修正 v5：修正了快取儲存的內容與時機 ***
     """
     log_prefix = "即時請求" if is_immediate_push else "排程推播"
     logging.info(f"[{log_prefix}] 開始為用戶 {user_id} 處理新聞請求...")
     
-    # 決定快取的 key
     cache_key = user_custom_keywords if user_custom_keywords else "__DEFAULT__"
     current_time = time.time()
 
@@ -441,40 +484,61 @@ def generate_and_push_news_for_user(user_id, user_custom_keywords=None, is_immed
         cached_item = NEWS_CACHE[cache_key]
         cache_age = current_time - cached_item.get("timestamp", 0)
         
-        if cache_age < NEWS_CACHE_DURATION_SECONDS:
+        if cache_age < NEWS_SUMMARY_CACHE_SECONDS:
             logging.info(f"新聞快取命中！(關鍵字: '{cache_key}', 年齡: {int(cache_age)}秒)")
-            cached_summary = cached_item.get("summary")
-            if cached_summary:
-                # 加上一個提示，讓用戶知道這是快取的內容
-                cached_reply = f"（從快取提供😊）\n{cached_summary}"
-                messages_to_send = handle_llm_response_with_think(cached_reply)
+            # 快取中已儲存了最終格式化好的內容
+            cached_reply = cached_item.get("reply_content")
+            if cached_reply:
+                # 快取內容不包含思考過程，所以直接分割並發送
+                messages_to_send = split_long_message(cached_reply)
                 send_line_messages(user_id, reply_token, messages_to_send)
-                return # *** 快取命中，提前結束 ***
+                return
 
+    # --- 步驟 2: 如果快取未命中，執行完整流程 ---
     logging.info(f"新聞快取未命中或已過期 (關鍵字: '{cache_key}')，執行完整新聞摘要流程。")
-
-    # --- 步驟 2: 如果快取未命中，則執行完整流程 ---
     articles = fetch_and_parse_articles(custom_query=user_custom_keywords, limit=NEWS_FETCH_TARGET_COUNT)
     if not articles:
-        keywords_msg = f"「{user_custom_keywords}」" if user_custom_keywords else "預設主題"
-        send_line_messages(user_id, reply_token, [f"抱歉，目前未能根據您的關鍵字 {keywords_msg} 找到可成功擷取的新聞。"])
+        send_line_messages(user_id, reply_token, [f"抱歉，目前未能根據您的關鍵字「{user_custom_keywords or '預設主題'}」找到可成功擷取的新聞。"])
         return
 
-    final_summary = summarize_news_flow(articles)
-    if not final_summary or final_summary.startswith("抱歉，"):
-        send_line_messages(user_id, reply_token, [final_summary or "抱歉，今日新聞摘要生成異常，內容為空。"])
+    final_summary_raw = summarize_news_flow(articles) # 這是 LLM 的原始輸出
+    if not final_summary_raw or final_summary_raw.startswith("抱歉，"):
+        send_line_messages(user_id, reply_token, [final_summary_raw or "抱歉，今日新聞摘要生成異常，內容為空。"])
         return
 
-    # --- 步驟 3: 儲存新的快取 ---
-    NEWS_CACHE[cache_key] = {
-        "timestamp": current_time,
-        "summary": final_summary
-    }
-    save_json_data(NEWS_CACHE, NEWS_CACHE_FILE)
-    logging.info(f"已更新新聞快取 (關鍵字: '{cache_key}')。")
+    # --- 步驟 3: 對 LLM 原始輸出進行最終的格式化處理 ---
+    # 3.1 分割思考過程和正式內容
+    parsed_result = handle_llm_response_with_think(final_summary_raw)
+    thinking_messages = parsed_result["thinking_messages"]
+    formal_messages = parsed_result["formal_messages"]
 
-    # --- 步驟 4: 發送新生成的摘要給用戶 ---
-    messages_to_send = handle_llm_response_with_think(final_summary)
+    # 3.2 準備要發送和儲存的正式內容
+    final_formal_reply = ""
+    if formal_messages:
+        # 組合所有正式訊息部分（以防被分割）
+        # 注意：我們不再在訊息中加入分頁符 (x/y)，因為這會被存入快取
+        # 分頁符應該由 split_long_message 在最後發送時處理
+        # 為了簡化，我們先假設正式回覆不會太長以至於需要分割
+        generation_time = datetime.fromtimestamp(current_time)
+        time_str = generation_time.strftime("%Y-%m-%d %H:%M")
+        
+        # 將所有正式訊息合併為一個字串，並在最前面加上時間戳記
+        full_formal_text = "\n".join(formal_messages)
+        final_formal_reply = f"這份新聞摘要產生於 {time_str}\n\n{full_formal_text}"
+
+    # --- 步驟 4: 儲存處理完成後的內容到快取 ---
+    if final_formal_reply:
+        NEWS_CACHE[cache_key] = {
+            "timestamp": current_time,
+            "reply_content": final_formal_reply # 儲存已包含時間戳記的最終內容
+        }
+        save_json_data(NEWS_CACHE, NEWS_CACHE_FILE)
+        logging.info(f"已更新新聞快取 (關鍵字: '{cache_key}')。")
+
+    # --- 步驟 5: 將所有部分組合起來發送給用戶 ---
+    # 思考過程 + 帶有時間戳記的正式回覆
+    # 我們需要重新分割一次 final_formal_reply，因為它現在變長了
+    messages_to_send = thinking_messages + split_long_message(final_formal_reply)
     send_line_messages(user_id, reply_token, messages_to_send)
     
     logging.info(f"[{log_prefix}] 已完成對用戶 {user_id} 的新聞推送。")
@@ -531,28 +595,37 @@ def webhook():
 
 def handle_llm_response_with_think(llm_full_response):
     """
-    *** 已修正 v3：只負責分割字串，不負責發送 ***
-    返回一個準備要發送的訊息列表。
+    *** 已修正 v5：返回結構化字典，而非扁平列表 ***
+    解析帶有 <think> 標籤的 LLM 回應，並將其分離。
     """
     think_pattern = re.compile(r"<think>(.*?)</think>", re.DOTALL | re.IGNORECASE)
     match = think_pattern.search(llm_full_response)
     
-    messages_to_send = []
-    
+    # 初始化要返回的字典
+    result = {
+        "thinking_messages": [],
+        "formal_messages": []
+    }
+
+    # 因為在免費版的line message api 的 push數目有限 因此 為了讓正式回應使用reply 所以把thinking遮起來 把reply機會讓給正式回應
+    show_thinking = os.getenv("SHOW_THINKING_PROCESS", "false").lower() == "true"
+
     if match:
+        # 如果找到 <think> 標籤
         thinking_text = match.group(1).strip()
         formal_text = llm_full_response[match.end():].strip()
         
-        if thinking_text:
-            # messages_to_send.extend(split_long_message(f"⚙️ 我的思考過程：\n{thinking_text}"))
-            # 不發送思考過程 思考過程是否發送或許改成變數控制
-            pass
+        if thinking_text and show_thinking:
+            # 將思考過程分割後放入字典
+            result["thinking_messages"] = split_long_message(f"⚙️ 我的思考過程：\n{thinking_text}")
         if formal_text:
-            messages_to_send.extend(split_long_message(formal_text))
+            # 將正式內容分割後放入字典
+            result["formal_messages"] = split_long_message(formal_text)
     else:
-        messages_to_send.extend(split_long_message(llm_full_response))
+        # 如果沒有 <think> 標籤，所有內容都屬於正式內容
+        result["formal_messages"] = split_long_message(llm_full_response)
         
-    return messages_to_send
+    return result
 
 def handle_text_message_event(context_id, user_id, reply_token, user_text):
     """
@@ -579,15 +652,26 @@ def handle_text_message_event(context_id, user_id, reply_token, user_text):
     cmd_parts = command_text.lower().split()
     main_command = cmd_parts[0] if cmd_parts else ""
 
-    # --- 1. 新聞一次性查詢 (改為同步執行) ---
+    # --- 1. 新聞一次性查詢 (改為同步執行，並增加靈活的關鍵字解析) ---
     if main_command in ["新聞", "news", "新聞摘要"]:
         logging.info("偵測到「新聞一次性查詢」指令 (同步模式)。")
+        
+        # *** 修改開始 ***
         keyword_part = command_text[len(main_command):].strip()
         keywords = None
+
+        # 優先檢查 "關鍵字:" 格式
         if keyword_part.lower().startswith("關鍵字:"):
             keywords = keyword_part[len("關鍵字:"):].strip()
-            if not keywords: keywords = None
+        # 如果不是 "關鍵字:" 格式，但仍然有內容，則將其全部視為關鍵字
+        elif keyword_part:
+            keywords = keyword_part
         
+        # 最後確保如果關鍵字是空字串，將其視為 None
+        if not keywords:
+            keywords = None
+        # *** 修改結束 ***
+
         # *** 修改核心 ***
         # 不再註冊背景任務，而是直接呼叫新聞處理函式，並傳入 reply_token
         generate_and_push_news_for_user(
