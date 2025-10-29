@@ -78,7 +78,7 @@ NEWS_FETCH_TARGET_COUNT = 7
 USER_AGENT = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36'
 
 NEWS_CACHE_FILE = "news_cache.json"
-NEWS_SUMMARY_CACHE_SECONDS = 3600 * 8  # 8 小時
+NEWS_SUMMARY_CACHE_SECONDS = 3600 * 4  # 4 小時
 
 # --- 用戶個人資料快取 (in-memory) ---
 USER_PROFILE_CACHE = {}
