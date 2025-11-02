@@ -16,6 +16,7 @@ import os
 import platform
 import sys
 import time
+import uuid
 import json
 import logging
 import hashlib
@@ -42,7 +43,11 @@ from selenium import webdriver
 # from selenium.webdriver.chrome.service import Service
 from selenium.webdriver.chrome.options import Options
 # from webdriver_manager.chrome import ChromeDriverManager
+from selenium.webdriver.common.by import By
+from selenium.webdriver.support.ui import WebDriverWait
+from selenium.webdriver.support import expected_conditions as EC
 from selenium.common.exceptions import WebDriverException
+from selenium.common.exceptions import TimeoutException
 
 # (在檔案頂部，與其他 import 放在一起)
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -74,7 +79,7 @@ DEFAULT_NEWS_KEYWORDS = "大型語言模型 OR LLM OR 生成式AI OR OpenAI OR G
 USER_PREFERENCES_FILE = "user_preferences.json"
 CONVERSATION_HISTORY_FILE = "conversation_history.json"
 MAX_HISTORY_MESSAGES = int(os.getenv("MAX_HISTORY_MESSAGES", "50"))
-NEWS_FETCH_TARGET_COUNT = 7
+NEWS_FETCH_TARGET_COUNT = 6
 USER_AGENT = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36'
 
 NEWS_CACHE_FILE = "news_cache.json"
@@ -97,7 +102,7 @@ PROMPT_FOR_INDIVIDUAL_SUMMARY = (
 current_date = datetime.now().strftime("%Y-%m-%d %H:%M")
 PROMPT_FOR_FINAL_AGGREGATION = (
     f"今天日期是 {current_date}。\n"
-    "你是一位風趣幽默、知識淵博的科技新聞 Podcast 主持人。你的聽眾是 Line 用戶，他們喜歡輕鬆、易懂且帶有 Emoji 的內容。"
+    "你是一位風趣幽默、知識淵博的新聞 Podcast 主持人。你的聽眾是 Line 用戶，他們喜歡輕鬆、易懂且帶有 Emoji 的內容。"
     "接下來我會提供數則「已經被精簡過的新聞摘要」。請你根據這些摘要，發揮你的主持風格，將它們整合成一篇連貫的談話性內容。"
     "請只整合最新新聞摘要，過舊的請忽略。"
     "你的任務是：\n"
@@ -145,12 +150,171 @@ newspaper_config.request_timeout = 15
 newspaper_config.memoize_articles = False
 
 chrome_options = Options()
-chrome_options.add_argument("--headless")
-chrome_options.add_argument("--disable-gpu")
-chrome_options.add_argument("--no-sandbox")
-chrome_options.add_argument("--disable-dev-shm-usage")
-chrome_options.add_argument("--window-size=1024x400")
+# chrome_options.add_argument("--headless")
+# chrome_options.add_argument("--disable-gpu")
+# chrome_options.add_argument("--no-sandbox")
+# chrome_options.add_argument("--disable-dev-shm-usage")
+chrome_options.add_argument("--window-size=1024x800")
 chrome_options.add_argument(f"user-agent={USER_AGENT}")
+
+
+def _dom_is_stable(driver, min_text_len=500, settle_checks=3, interval=0.6, overall_timeout=20):
+    """
+    回傳 True 當 DOM 文字長度穩定（連續 settle_checks 次幾乎不再成長），
+    並且長度超過 min_text_len。避免在 SPA/React 還在掛載時就讀空白。
+    """
+    t0 = time.time()
+    last_len = -1
+    stable = 0
+    while time.time() - t0 < overall_timeout:
+        try:
+            txt_len = driver.execute_script("return (document.body && document.body.innerText) ? document.body.innerText.length : 0;")
+        except WebDriverException:
+            txt_len = 0
+        if last_len >= 0 and abs(txt_len - last_len) < 30 and txt_len >= min_text_len:
+            stable += 1
+            if stable >= settle_checks:
+                return True
+        else:
+            stable = 0
+        last_len = txt_len
+        time.sleep(interval)
+    return False
+
+def _get_outer_html(driver):
+    try:
+        return driver.execute_script("return document.documentElement ? document.documentElement.outerHTML : ''") or ""
+    except WebDriverException:
+        return ""
+
+def _try_all_iframes_html(driver, max_frames=10):
+    """
+    有些新聞站把正文放在 iframe。這裡會把所有 iframe outerHTML 拼起來。
+    若跨網域不能進入某些 iframe，會自動跳過。
+    """
+    htmls = []
+    try:
+        frames = driver.find_elements(By.CSS_SELECTOR, "iframe")
+    except WebDriverException:
+        frames = []
+    if not frames:
+        return ""
+    for idx, frame in enumerate(frames[:max_frames]):
+        try:
+            driver.switch_to.frame(frame)
+            time.sleep(0.2)
+            # 等這層 frame DOM 有 body
+            try:
+                WebDriverWait(driver, 5).until(EC.presence_of_element_located((By.TAG_NAME, "body")))
+            except Exception:
+                pass
+            # 等一點穩定
+            _dom_is_stable(driver, min_text_len=200, settle_checks=2, interval=0.4, overall_timeout=6)
+            htmls.append(_get_outer_html(driver))
+        except Exception:
+            pass
+        finally:
+            driver.switch_to.default_content()
+    return "\n<!-- IFRAME_JOIN_BOUNDARY -->\n".join([h for h in htmls if h])
+
+def resolve_google_news_redirect(u: str, timeout: int = 10) -> str:
+    try:
+        pu = urlparse(u)
+        if pu.netloc.endswith("news.google.com"):
+            qs = parse_qs(pu.query)
+            if "url" in qs and qs["url"]:
+                return unquote(qs["url"][0])
+        try:
+            r = requests.head(u, allow_redirects=True, timeout=timeout)
+            if r.url and r.url != u:
+                return r.url
+        except Exception:
+            pass
+    except Exception:
+        pass
+    return u
+
+def fetch_article_with_selenium_v2(url: str, timeout: int = 60, headless: bool = True, min_text_len: int = 700) -> str:
+    """
+    穩定版抓取流程：
+    1) 先解開 Google News RSS 轉址（即使你說已OK，保留這步更穩）
+    2) Selenium 以 page_load_strategy="none" 進站
+    3) 等 body 出現 + 等 DOM 文字長度穩定（非 onload）
+    4) 取 outerHTML；若 outerHTML 很短 → 嘗試逐一抓 iframe 的 outerHTML
+    5) 落檔到 /tmp 方便排錯
+    """
+    url = resolve_google_news_redirect(url)
+
+    opts = Options()
+    if headless:
+        opts.add_argument("--headless=new")
+    opts.add_argument("--no-sandbox")
+    opts.add_argument("--disable-dev-shm-usage")
+    opts.add_argument("--disable-gpu")
+    opts.add_argument("--disable-extensions")
+    opts.add_argument("--window-size=1280,2400")
+    opts.page_load_strategy = "none"  # 或試 "eager" 比對效果
+    # 加速：關圖片/字型，避免第三方資源拖慢
+    opts.add_experimental_option("prefs", {
+        "profile.managed_default_content_settings.images": 2,
+        "profile.managed_default_content_settings.fonts": 2,
+    })
+    # 可自訂 UA（某些站較寬鬆）
+    # opts.add_argument("--user-agent=Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/140 Safari/537.36")
+
+    snap_id = uuid.uuid4().hex[:8]
+    with webdriver.Chrome(options=opts) as driver:
+        driver.set_page_load_timeout(timeout)
+        driver.set_script_timeout(timeout)
+
+        driver.get(url)
+
+        # 先等 <body> 出現（不等整頁 complete）
+        try:
+            WebDriverWait(driver, min(20, timeout)).until(
+                EC.presence_of_element_located((By.TAG_NAME, "body"))
+            )
+        except TimeoutException:
+            pass
+
+        # 微滾動讓延遲載入觸發
+        try:
+            driver.execute_script("window.scrollTo(0, 600)")
+            time.sleep(0.2)
+            driver.execute_script("window.scrollTo(0, 0)")
+        except Exception:
+            pass
+
+        # 等 DOM 穩定（不是 onload）
+        _ = _dom_is_stable(driver, min_text_len=min_text_len, settle_checks=3, interval=0.6, overall_timeout=25)
+
+        # 抓最外層 HTML
+        html = _get_outer_html(driver)
+        text_len = 0
+        try:
+            text_len = driver.execute_script("return (document.body && document.body.innerText) ? document.body.innerText.length : 0;")
+        except Exception:
+            pass
+
+        # 若外層文字很短，嘗試抓 iframe 內容（常見於廣告/防爬殼頁）
+        if text_len < min_text_len:
+            iframe_html = _try_all_iframes_html(driver, max_frames=12)
+            if iframe_html:
+                html = html + "\n<!-- CONCAT IFRAME HTML BELOW -->\n" + iframe_html
+
+        # 落檔方便 debug
+        out_path = f"/tmp/selenium_snap_{snap_id}.html"
+        try:
+            with open(out_path, "w", encoding="utf-8") as f:
+                f.write(html or "")
+        except Exception:
+            out_path = None
+
+        # 你可以在 log 裡打這些資訊
+        print(f"[Selenium] url={driver.current_url} readyState={driver.execute_script('return document.readyState')}")
+        print(f"[Selenium] text_len={text_len} saved={out_path}")
+
+        return html or ""
 
 def get_real_url(google_news_url):
     try:
@@ -167,7 +331,7 @@ def fetch_article_with_selenium(url):
     driver = None
     try:
         driver = webdriver.Chrome(options=chrome_options)
-        driver.set_page_load_timeout(20)
+        driver.set_page_load_timeout(60)
         driver.get(url)
         time.sleep(2.5)
         return driver.page_source
@@ -209,12 +373,14 @@ def fetch_and_parse_articles(custom_query=None, limit=NEWS_FETCH_TARGET_COUNT):
             
             if len(article.text) < 200:
                 logging.warning(f"  [執行緒] 內容過短，為 {entry.title} 啟用 Selenium。")
-                html_content = fetch_article_with_selenium(real_url)
+#                 html_content = fetch_article_with_selenium(real_url)
+                html_content = fetch_article_with_selenium_v2(real_url, timeout=60, headless=False, min_text_len=700)
+
                 if html_content:
                     article.download(input_html=html_content)
                     article.parse()
 
-            if article.title and len(article.text) > 200:
+            if article.title and len(article.text) > 50:
                 logging.info(f"  [執行緒] 成功取得: {article.title}")
                 return {
                     'title': article.title,
@@ -238,9 +404,9 @@ def fetch_and_parse_articles(custom_query=None, limit=NEWS_FETCH_TARGET_COUNT):
     
     # max_workers 可以根據您的伺服器性能調整，8 是一個比較合理的起始值
     try:
-        max_workers = int(os.getenv("NEWS_FETCH_MAX_WORKERS", "4"))
+        max_workers = int(os.getenv("NEWS_FETCH_MAX_WORKERS", "1"))
     except ValueError:
-        max_workers = 4 # 如果 .env 中的值不是數字，則使用安全的預設值
+        max_workers = 1 # 如果 .env 中的值不是數字，則使用安全的預設值
     
     logging.info(f"啟動 ThreadPoolExecutor，最大平行度 (max_workers) 設為: {max_workers}")
 
@@ -360,7 +526,7 @@ def call_openai_api(messages, model=OPENAI_COMPLETION_MODEL, max_tokens=4000, te
     try:
         response = requests.post(f"{OPENAI_BASE_URL}/v1/chat/completions", headers=headers, json=data, timeout=980)
         response.raise_for_status()
-        logging.info(response.json())
+#         logging.info(response.json())
 #         content = response.json()["choices"][0]["message"]["content"].strip()
         resp_json = response.json()
         logging.info(str(resp_json))  # 建議保留以便除錯
