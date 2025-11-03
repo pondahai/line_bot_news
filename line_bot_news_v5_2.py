@@ -23,7 +23,7 @@ import base64
 import re
 import atexit
 import argparse
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 import urllib.parse
 from urllib.parse import urlparse, parse_qs, unquote
 
@@ -98,13 +98,12 @@ current_date = datetime.now().strftime("%Y-%m-%d %H:%M")
 PROMPT_FOR_FINAL_AGGREGATION = (
     f"今天日期是 {current_date}。\n"
     "你是一位風趣幽默、知識淵博的新聞 Podcast 主持人。你的聽眾是 Line 用戶，他們喜歡輕鬆、易懂且帶有 Emoji 的內容。"
-    "接下來我會提供數則「已經被精簡過的新聞摘要」。請你根據這些摘要，發揮你的主持風格，將它們整合成一篇連貫的談話性內容。"
-    "請只整合最新新聞摘要，過舊的請忽略。"
+    "接下來我會提供數則「附有發布日期的精簡新聞摘要」。請你根據這些摘要，發揮你的主持風格，將它們整合成一篇連貫的談話性內容。"
     "你的任務是：\n"
     "1. 用生動的語氣開場，吸引聽眾注意。\n"
-    "2. 將各則新聞摘要自然地串連起來，可以加上你的評論或觀點來銜接，但不要杜撰不存在的事實。\n"
+    "2. 將各則新聞摘要自然地串連起來，你可以根據新聞的發布日期（例如使用『昨天』、『今天早上』等詞彙）來增加時效感，但不要杜撰不存在的事實。\n"
     "3. 在提到每則新聞的重點後，請務必附上這則新聞的原始標題，格式如下：\n"
-    "   - 標題：[原始新聞標題]\n"
+    "   - 標題：[原始新聞標題] - 發布時間：[新聞發布時間]\n"
     "4. 全程多使用 Emoji 來增加活潑感。\n"
     "5. 要嚴肅應對每則有負面情緒的新聞例如災難與傷亡。\n"
     "6. 最後結論要加註這是AI生成的內容，讀者應注意正確性。\n"
@@ -329,12 +328,24 @@ def fetch_and_parse_articles(custom_query=None, limit=NEWS_FETCH_TARGET_COUNT):
                             article.parse()
 
                     if article.title and len(article.text) > 50:
-                        logging.info(f"  成功取得: {article.title}")
+                        publish_date = None
+                        # 優先使用 newspaper3k 從網頁解析的日期，通常更準確
+                        if hasattr(article, 'publish_date') and article.publish_date:
+                            publish_date = article.publish_date.astimezone() # 轉換為帶有本地時區的 datetime 物件
+                        # 如果網頁上沒有日期，使用 RSS feed 的 pubDate 作為備援
+                        elif hasattr(entry, 'published_parsed') and entry.published_parsed:
+                            # entry.published_parsed 是 time.struct_time，需要轉換
+                            # 注意：原始時間是 GMT，我們需要處理時區
+                            dt_gmt = datetime.fromtimestamp(time.mktime(entry.published_parsed), tz=timezone.utc)
+                            publish_date = dt_gmt.astimezone() # 轉換為本地時區
+                            
+                        logging.info(f"  成功取得: {article.title} (發布於: {publish_date.strftime('%Y-%m-%d %H:%M') if publish_date else '未知'})")
                         successful_articles.append({
                             'title': article.title,
                             'text': article.text,
                             'url': real_url,
-                            'source': entry.source.title if hasattr(entry, 'source') and hasattr(entry.source, 'title') else "未知來源"
+                            'source': entry.source.title if hasattr(entry, 'source') and hasattr(entry.source, 'title') else "未知來源",
+                            'publish_date': publish_date  # 將日期物件儲存起來
                         })
                         processed_urls.add(real_url)
                     else:
@@ -348,6 +359,27 @@ def fetch_and_parse_articles(custom_query=None, limit=NEWS_FETCH_TARGET_COUNT):
         return []
 
     logging.info(f">>> 循序新聞內文擷取完成，共成功取得 {len(successful_articles)} 篇。")
+    # --- 新增的過濾與排序邏輯 ---
+    if successful_articles:
+        now = datetime.now().astimezone()
+        # 可以將天數設定為環境變數，例如 3 天
+        days_limit = int(os.getenv("NEWS_FETCH_DAYS_LIMIT", "3"))
+        time_threshold = now - timedelta(days=days_limit)
+        
+        original_count = len(successful_articles)
+        
+        # 1. 過濾掉沒有日期或太舊的文章
+        successful_articles = [
+            art for art in successful_articles 
+            if art.get('publish_date') and art['publish_date'] > time_threshold
+        ]
+        
+        # 2. 根據發布日期由新到舊排序
+        successful_articles.sort(key=lambda x: x.get('publish_date'), reverse=True)
+        
+        filtered_count = len(successful_articles)
+        logging.info(f"日期過濾完成: 從 {original_count} 篇篩選出 {filtered_count} 篇近 {days_limit} 天內的新聞。")
+        
     return successful_articles[:limit]
 
 def _extract_assistant_text_from_response(resp_json: dict) -> str:
@@ -446,7 +478,7 @@ def call_openai_api(messages, model=OPENAI_COMPLETION_MODEL, max_tokens=4000, te
         response = requests.post(f"{OPENAI_BASE_URL}/v1/chat/completions", headers=headers, json=data, timeout=980)
         response.raise_for_status()
         resp_json = response.json()
-        logging.info(str(resp_json)) 
+#         logging.info(str(resp_json)) 
 
         content = _extract_assistant_text_from_response(resp_json)
         if (not content or not content.strip()) and os.getenv("ALLOW_REASONING_FALLBACK", "false").lower() == "true":
@@ -502,13 +534,25 @@ def summarize_news_flow(articles_data):
         think_pattern = re.compile(r"<think>.*?</think>", re.DOTALL | re.IGNORECASE)
         cleaned_summary = re.sub(think_pattern, '', raw_summary).strip()
         if len(raw_summary) != len(cleaned_summary): logging.info(f"  已清理掉 <think> 標籤。")
-        individual_summaries.append({'title': article['title'], 'url': article['url'], 'summary': cleaned_summary})
+        individual_summaries.append({'title': article['title'], 'url': article['url'], 'summary': cleaned_summary,
+            'publish_date': article.get('publish_date')})
         logging.info(f"  摘要完成，長度: {len(cleaned_summary)} 字")
         logging.info(f"  等待30秒 避免LLM速率限制")
         time.sleep(30) # 降低LLM速率
     if not individual_summaries: return "抱歉，今日新聞摘要生成過程發生問題，無法產出內容。"
     logging.info("--- 開始第二階段摘要：彙整生成 Podcast 內容 ---")
-    summaries_for_prompt = [f"新聞 {i+1}:\n標題: {item['title']}\n摘要內容: {item['summary']}\n---" for i, item in enumerate(individual_summaries)]
+#     summaries_for_prompt = [f"新聞 {i+1}:\n標題: {item['title']}\n摘要內容: {item['summary']}\n---" for i, item in enumerate(individual_summaries)]
+    summaries_for_prompt = []
+    for i, item in enumerate(individual_summaries):
+        # 格式化日期，如果不存在則給予提示
+        date_str = item['publish_date'].strftime("%Y-%m-%d") if item.get('publish_date') else "日期未知"
+        prompt_line = (
+            f"新聞 {i+1} (發布於: {date_str}):\n"
+            f"標題: {item['title']}\n"
+            f"摘要內容: {item['summary']}\n---"
+        )
+        summaries_for_prompt.append(prompt_line)
+    
     final_user_prompt = "\n".join(summaries_for_prompt)
     final_summary = call_openai_api([{"role": "system", "content": PROMPT_FOR_FINAL_AGGREGATION}, {"role": "user", "content": final_user_prompt}], model=os.getenv("OPENAI_COMPLETION_MODEL", "gpt-4o"), max_tokens=3000, temperature=0.7)
     return final_summary
