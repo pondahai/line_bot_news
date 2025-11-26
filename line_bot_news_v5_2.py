@@ -7,6 +7,7 @@
 # - 實施「工作範疇」的 Selenium 實例管理模式。
 # - 在單次新聞抓取任務中，只啟動一次瀏覽器，並重複使用該實例處理所有文章。
 # - 此修改旨在透過避免反覆啟動瀏覽器的開銷來提升效能，並降低系統資源的瞬間負載。
+# - 對話紀錄新增時間戳記 (timestamp)，以便追蹤訊息時間。
 # ==============================================================================
 
 # --- Python Standard Libraries ---
@@ -75,7 +76,7 @@ VISUAL_SEPARATION_DELAY = float(os.getenv("VISUAL_SEPARATION_DELAY", "1.0"))
 DEFAULT_NEWS_KEYWORDS = "大型語言模型 OR LLM OR 生成式AI OR OpenAI OR Gemini OR Claude"
 USER_PREFERENCES_FILE = "user_preferences.json"
 CONVERSATION_HISTORY_FILE = "conversation_history.json"
-MAX_HISTORY_MESSAGES = int(os.getenv("MAX_HISTORY_MESSAGES", "50"))
+MAX_HISTORY_MESSAGES = int(os.getenv("MAX_HISTORY_MESSAGES", "10"))
 NEWS_FETCH_TARGET_COUNT = 6
 USER_AGENT = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36'
 
@@ -745,6 +746,26 @@ def generate_and_push_news_for_user(user_id, user_custom_keywords=None, is_immed
     
     logging.info(f"[{log_prefix}] 已完成對用戶 {user_id} 的新聞推送。")
 
+    # --- [NEW] 將推播內容寫入對話紀錄，讓機器人有記憶 ---
+    try:
+        history = CONVERSATION_HISTORY.get(user_id, [])
+        # 模擬 assistant 的發言紀錄
+        history.append({
+            "role": "assistant", 
+            "content": final_reply_for_user,
+            "timestamp": datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+        })
+        
+        # 維持紀錄長度限制
+        if len(history) > MAX_HISTORY_MESSAGES:
+            history = history[-MAX_HISTORY_MESSAGES:]
+            
+        CONVERSATION_HISTORY[user_id] = history
+        save_json_data(CONVERSATION_HISTORY, CONVERSATION_HISTORY_FILE)
+        logging.info(f"[{log_prefix}] 已將新聞內容寫入用戶 {user_id} 的對話紀錄。")
+    except Exception as e:
+        logging.error(f"[{log_prefix}] 寫入對話紀錄時發生錯誤: {e}")
+
 def generate_news_for_single_user_job(user_id, keywords, remaining_users, is_immediate=False):
     with app.app_context():
         log_prefix = "背景即時請求" if is_immediate else "背景排程推播"
@@ -830,7 +851,11 @@ def handle_text_message_event(context_id, user_id, reply_token, user_text):
     if context_id.startswith(('G', 'R')): formatted_message_content = f"{display_name}: {user_text}"
     else: formatted_message_content = user_text
     history = CONVERSATION_HISTORY.get(context_id, [])
-    history.append({"role": "user", "content": formatted_message_content})
+    history.append({
+        "role": "user", 
+        "content": formatted_message_content,
+        "timestamp": datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+    })
     if len(history) > MAX_HISTORY_MESSAGES: history = history[-MAX_HISTORY_MESSAGES:]
     CONVERSATION_HISTORY[context_id] = history
     save_json_data(CONVERSATION_HISTORY, CONVERSATION_HISTORY_FILE)
@@ -892,7 +917,11 @@ def handle_text_message_event(context_id, user_id, reply_token, user_text):
         
         if not llm_response.startswith("抱歉，"):
             cleaned_bot_response = "\n".join(formal_messages)
-            history.append({"role": "assistant", "content": cleaned_bot_response})
+            history.append({
+                "role": "assistant", 
+                "content": cleaned_bot_response,
+                "timestamp": datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+            })
             if len(history) > MAX_HISTORY_MESSAGES:
                 history = history[-MAX_HISTORY_MESSAGES:]
             CONVERSATION_HISTORY[context_id] = history
