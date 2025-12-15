@@ -126,28 +126,28 @@ PROMPT_FOR_FINAL_AGGREGATION = (
 )
 
 # --- 機器人指令幫助訊息 ---
-HELP_MESSAGE = """
+HELP_MESSAGE = f"""
 哈囉！👋 我是你的 AI 助理！
 
-你可以透過 `/bot` 指令與我互動。
+你可以透過 `{Config.BOT_TRIGGER_WORD}` 指令與我互動。
 
 📰【新聞功能】
-🔹 `/bot 新聞`
+🔹 `{Config.BOT_TRIGGER_WORD} 新聞`
    立即取得一篇 AI 主題的新聞摘要。
-🔹 `/bot 新聞 關鍵字:你想看的內容`
+🔹 `{Config.BOT_TRIGGER_WORD} 新聞 關鍵字:你想看的內容`
    立即查詢特定主題的新聞。
-🔹 `/bot 訂閱`
+🔹 `{Config.BOT_TRIGGER_WORD} 訂閱`
    訂閱每日 AI 新聞推播。
-🔹 `/bot 訂閱 [你的主題]`
+🔹 `{Config.BOT_TRIGGER_WORD} 訂閱 [你的主題]`
    訂閱每日特定主題的新聞。
-🔹 `/bot 查看訂閱`
+🔹 `{Config.BOT_TRIGGER_WORD} 查看訂閱`
    看看你目前訂閱了什麼。
-🔹 `/bot 取消訂閱`
+🔹 `{Config.BOT_TRIGGER_WORD} 取消訂閱`
    取消每日新聞推播。
 
 💬【隨意聊天】
-除了新聞，也可以隨時用 `/bot` 問我任何問題喔！
-範例：`/bot 幫我規劃一下週末行程`
+除了新聞，也可以隨時用 `{Config.BOT_TRIGGER_WORD}` 問我任何問題喔！
+範例：`{Config.BOT_TRIGGER_WORD} 幫我規劃一下週末行程`
 """
 
 # ==============================================================================
