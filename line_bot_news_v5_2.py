@@ -63,31 +63,45 @@ logging.basicConfig(
     stream=sys.stdout
 )
 
-# --- 全域變數與常數 ---
-BOT_TRIGGER_WORD = os.getenv("BOT_TRIGGER_WORD", "/bot")
-OPENAI_COMPLETION_MODEL = os.getenv("OPENAI_COMPLETION_MODEL", "gpt-4o-mini")
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
-LINE_CHANNEL_ACCESS_TOKEN = os.getenv("LINE_CHANNEL_ACCESS_TOKEN")
-LINE_CHANNEL_SECRET = os.getenv("LINE_CHANNEL_SECRET")
-OPENAI_BASE_URL = os.getenv("OPENAI_BASE_URL", "https://api.openai.com")
-TARGET_USER_ID_FOR_TESTING = os.getenv("TARGET_USER_ID_FOR_TESTING")
+# --- Configuration Class (Centralized) ---
+class Config:
+    # --- Environment Variables ---
+    BOT_TRIGGER_WORD = os.getenv("BOT_TRIGGER_WORD", "/bot")
+    OPENAI_COMPLETION_MODEL = os.getenv("OPENAI_COMPLETION_MODEL", "gpt-4o-mini")
+    OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+    LINE_CHANNEL_ACCESS_TOKEN = os.getenv("LINE_CHANNEL_ACCESS_TOKEN")
+    LINE_CHANNEL_SECRET = os.getenv("LINE_CHANNEL_SECRET")
+    OPENAI_BASE_URL = os.getenv("OPENAI_BASE_URL", "https://api.openai.com")
+    TARGET_USER_ID_FOR_TESTING = os.getenv("TARGET_USER_ID_FOR_TESTING")
+    
+    VISUAL_SEPARATION_DELAY = float(os.getenv("VISUAL_SEPARATION_DELAY", "1.0"))
+    MAX_HISTORY_MESSAGES = int(os.getenv("MAX_HISTORY_MESSAGES", "10"))
+    MAX_MESSAGE_LENGTH = int(os.getenv("MAX_MESSAGE_LENGTH", "4800"))
+    
+    SELENIUM_HEADLESS = os.getenv("SELENIUM_HEADLESS", "true").lower() == "true"
+    NEWS_FETCH_DAYS_LIMIT = int(os.getenv("NEWS_FETCH_DAYS_LIMIT", "3"))
+    ALLOW_REASONING_FALLBACK = os.getenv("ALLOW_REASONING_FALLBACK", "false").lower() == "true"
+    LINE_MIN_PUSH_INTERVAL_SEC = float(os.getenv("LINE_MIN_PUSH_INTERVAL_SEC", "1.2"))
+    SHOW_THINKING_PROCESS = os.getenv("SHOW_THINKING_PROCESS", "false").lower() == "true"
+    FALLBACK_ON_EMPTY = os.getenv("FALLBACK_ON_EMPTY", "true").lower() == "true"
+    RUN_JOB_ON_STARTUP = os.getenv("RUN_JOB_ON_STARTUP", "False").lower() == "true"
+    PORT = int(os.environ.get("PORT", 5000))
+    
+    # --- Constants & File Paths ---
+    DEFAULT_NEWS_KEYWORDS = "大型語言模型 OR LLM OR 生成式AI OR OpenAI OR Gemini OR Claude"
+    USER_PREFERENCES_FILE = "user_preferences.json"
+    CONVERSATION_HISTORY_FILE = "conversation_history.json"
+    NEWS_FETCH_TARGET_COUNT = 6
+    USER_AGENT = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36'
+    NEWS_CACHE_FILE = "news_cache.json"
+    NEWS_SUMMARY_CACHE_SECONDS = 3600 * 4
+    USER_PROFILE_CACHE_SECONDS = 7200
 
-VISUAL_SEPARATION_DELAY = float(os.getenv("VISUAL_SEPARATION_DELAY", "1.0"))
-DEFAULT_NEWS_KEYWORDS = "大型語言模型 OR LLM OR 生成式AI OR OpenAI OR Gemini OR Claude"
-USER_PREFERENCES_FILE = "user_preferences.json"
-CONVERSATION_HISTORY_FILE = "conversation_history.json"
-MAX_HISTORY_MESSAGES = int(os.getenv("MAX_HISTORY_MESSAGES", "10"))
-NEWS_FETCH_TARGET_COUNT = 6
-USER_AGENT = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36'
-
-NEWS_CACHE_FILE = "news_cache.json"
-NEWS_SUMMARY_CACHE_SECONDS = 3600 * 4  # 4 小時
+# --- 全域變化與常數 (References to Config for backward compatibility within this script if needed, 
+# but we will replace usages) ---
 
 # --- 用戶個人資料快取 (in-memory) ---
 USER_PROFILE_CACHE = {}
-USER_PROFILE_CACHE_SECONDS = 7200  # 快取 2 小時
-
-MAX_MESSAGE_LENGTH = int(os.getenv("MAX_MESSAGE_LENGTH", "4800"))
 
 # --- 兩階段摘要的 LLM Prompt 設定 ---
 PROMPT_FOR_INDIVIDUAL_SUMMARY = (
