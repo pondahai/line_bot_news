@@ -1,0 +1,30 @@
+# Environment Variables
+.env
+!.env.example
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+venv/
+env/
+.venv/
+.env/
+
+# Distribution / Packaging
+build/
+dist/
+*.egg-info/
+
+# Driver logs
+geckodriver.log
+chromedriver.log
+
+# IDEs
+.vscode/
+.idea/
+
+# Custom data files (if they contain private data)
+# conversation_history.json
+# user_preferences.json
+# news_cache.json
